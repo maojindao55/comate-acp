@@ -109,6 +109,11 @@ export class EventParser {
     const frame = raw as Record<string, unknown>;
     const kind = frame.type;
 
+    const info = frame.conversationInfo as Record<string, unknown> | undefined;
+    if (!this.observedConversationId && typeof info?.id === "string") {
+      this.observedConversationId = info.id;
+    }
+
     switch (kind) {
       case "conversation-messages":
         this.ingestMessageList(frame.messages);
@@ -293,6 +298,13 @@ export class EventParser {
       rawOutput: element.result,
     });
   }
+
+  /** Conversation id from any frame; the first snapshot already carries it. */
+  get conversationId(): string | undefined {
+    return this.observedConversationId;
+  }
+
+  private observedConversationId: string | undefined;
 
   /** Estimated tokens generated this turn, reasoning included. */
   estimatedOutputTokens(): number {

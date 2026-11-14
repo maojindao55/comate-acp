@@ -28,6 +28,7 @@ import {
   type ModeId,
 } from "./comateArgs.js";
 import { createParserState, EventParser, type ParserEvent, type ParserState, type RequiresActionPayload } from "./eventParser.js";
+import { materializePrompt, type MaterializedPrompt } from "./attachments.js";
 import type { TurnMetrics } from "./eventParser.js";
 import { ModelCatalog } from "./models.js";
 import { fetchPending } from "./pending.js";
@@ -74,17 +75,13 @@ function emit(client: AgentContext, sessionId: string, update: SessionUpdate): v
   void client.notify("session/update", { sessionId, update });
 }
 
-/** ACP prompts are content-block arrays; comatecli takes a single query string. */
-function flattenPrompt(blocks: ContentBlock[] | undefined): string {
-  if (!Array.isArray(blocks)) return "";
-  const parts: string[] = [];
-  for (const block of blocks) {
-    if (!block || typeof block !== "object") continue;
-    if (block.type === "text") parts.push(block.text);
-    else if (block.type === "resource_link") parts.push(block.uri ?? "");
-    else if (block.type === "resource") parts.push(block.resource?.uri ?? "");
-  }
-  return parts.filter(Boolean).join("\n\n");
+/**
+ * ACP prompts are content-block arrays; comatecli takes one query string plus
+ * `--attach-image` paths. Images arrive as base64 blocks with no path, so they
+ * have to be materialised before the turn can be run.
+ */
+async function flattenPrompt(blocks: ContentBlock[] | undefined): Promise<MaterializedPrompt> {
+  return materializePrompt(blocks);
 }
 
 function modeState(currentModeId: ModeId): SessionModeState {
@@ -302,6 +299,9 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
       active.delete(session.sessionId);
       if (settled) return;
       // A cancelled turn makes comatecli exit non-zero; that is not a failure.
+      // The id appears in the very first snapshot; do not wait for a terminal
+      // frame, otherwise a cancelled or short-circuited turn loses the mapping.
+      if (!conversationId && parser.conversationId) conversationId = parser.conversationId;
       const estimatedOutputTokens = parser.estimatedOutputTokens();
       if (cancelled || cancelRequested.has(session.sessionId) || signal.aborted) {
         cancelRequested.delete(session.sessionId);
@@ -536,17 +536,20 @@ const app = agent({ name: "comate-acp" })
   })
   .onRequest("session/prompt", async (ctx) => {
     const session = currentSession(ctx.params.sessionId);
-    const prompt = flattenPrompt(ctx.params.prompt);
-    if (!prompt.trim()) throw new RequestError(-32602, "prompt 不能为空");
+    const { text: prompt, images } = await flattenPrompt(ctx.params.prompt);
+    // A turn may carry only an image; comatecli still needs a query.
+    const query = prompt.trim() ? prompt : images.length ? "（请看附带的图片）" : "";
+    if (!query) throw new RequestError(-32602, "prompt 不能为空");
 
     let args = buildRunArgs({
-      prompt,
+      prompt: query,
       cwd: session.cwd,
       conversationId: session.conversationId,
       model: session.model,
       effort: session.effort,
       mode: session.mode,
       enableInteractiveTools: true,
+      attachImages: images,
     });
 
     for (let round = 0; round < MAX_APPROVAL_ROUNDS; round += 1) {

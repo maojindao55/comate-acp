@@ -37,6 +37,11 @@ permission requests back into `comatecli pending` / `--approve` / `--reject`.
 
 ## Design decisions
 
+**Images.** ACP sends `{ type: "image", mimeType, data }` base64 blocks with no
+path, while comatecli only takes `--attach-image <path>`. Blocks are written to a
+content-addressed cache under `~/.comate-acp/attachments/`, so the same image
+sent again on a later turn reuses one file.
+
 **The exit code is the only trustworthy turn terminator.** `comatecli` emits
 `conversation-status: Completed` even when the turn is merely parked on a pending
 approval, and `event-stream` deliberately writes no final frame. So the adapter
@@ -68,6 +73,7 @@ to be spawned through the current Node binary; `spawnComate` handles both.
 - `src/index.ts` — ACP methods, event → `session/update` mapping, turn lifecycle
 - `src/comateArgs.ts` — ACP session state → `comatecli run` argv
 - `src/eventParser.ts` — snapshot/delta reducer with dedupe
+- `src/attachments.ts` — materialises ACP image blocks for `--attach-image`
 - `src/pending.ts` — reads parked interactions for permission prompts
 - `src/comateExecutable.ts` — resolves the `comatecli` binary
 - `src/sessionStore.ts` — persists ACP session → conversation id

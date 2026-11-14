@@ -43,3 +43,4 @@ test("token estimate counts CJK per character and latin per four", async () => {
   // Mixed: 2 CJK + 8 latin -> 2 + 2
   assert.equal(estimateTokens("你好abcdefgh"), 4);
 });
+
