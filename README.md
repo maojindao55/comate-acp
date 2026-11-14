@@ -86,3 +86,17 @@ against the real thing:
 ```bash
 node test/client.mjs "your prompt"
 ```
+
+## Release
+
+Pushing a `v*` tag triggers `.github/workflows/publish.yml`: GitHub Release →
+`npm ci && npm run build && npm publish --access public` → npmmirror sync. The
+`NPM_TOKEN` secret must be set on the repository.
+
+For a one-shot local release (typecheck → test → build → version bump → commit
+and tag → optional push → optional publish → npmmirror sync):
+
+```bash
+npm run release          # 交互式选择 patch/minor/major/自定义
+npm run release:patch
+```
