@@ -1,0 +1,18 @@
+{
+  "status": "pending",
+  "conversationId": "d7054c8c-960c-4f84-a2a2-a7e8c7017cb0",
+  "toolId": "call_00_loajddw69ivh9ggijlamqpor",
+  "toolName": "run_command",
+  "actionType": "approve_command",
+  "cwd": "/tmp",
+  "resumeToken": "d7054c8c-960c-4f84-a2a2-a7e8c7017cb0:call_00_loajddw69ivh9ggijlamqpor",
+  "payload": {
+    "command": "ls /tmp",
+    "description": "List files in /tmp",
+    "state": "pending"
+  },
+  "continueCommands": [
+    { "label": "Approve", "command": "zulu run --conversation d7054c8c-960c-4f84-a2a2-a7e8c7017cb0 --approve" },
+    { "label": "Reject", "command": "zulu run --conversation d7054c8c-960c-4f84-a2a2-a7e8c7017cb0 --reject" }
+  ]
+}
