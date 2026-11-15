@@ -77,22 +77,131 @@ test("thought chunks are separated from answer text", () => {
   );
 });
 
-test("a resumed turn does not replay the previous answer", () => {
-  // comatecli replays the whole conversation when a turn is continued with -c,
-  // and neither message ids nor element ids stay stable, so identity has to
-  // come from "this message already finished".
-  const state = createParserState();
-  const run = (name) => {
+test("a new prompt skips loaded history even in a fresh adapter process", () => {
+  const run = (name, skipInitialHistory = false) => {
     const text = [];
     const parser = new EventParser((event) => {
       if (event.type === "text") text.push(event.text);
-    }, state);
+    }, createParserState(), { skipInitialHistory });
     for (const line of readLines(name)) parser.ingest(JSON.parse(line));
     return text.join("");
   };
 
   assert.equal(run("multiturn-1.jsonl"), "A");
-  assert.equal(run("multiturn-2.jsonl"), "B", "第二轮不应带出第一轮的 A");
+  assert.equal(run("multiturn-2.jsonl", true), "B", "第二轮不应带出第一轮的 A");
+});
+
+test("command approval resumes the same terminal message and forwards its answer and output once", () => {
+  // Reduced real Comate 2.0 streams: suspension marks the assistant success,
+  // reload marks it cancelled, then --approve appends to that same message.
+  const state = createParserState();
+  const events = [];
+  for (const name of ["command-suspend.jsonl", "command-resume.jsonl"]) {
+    const parser = new EventParser(event => events.push(event), state);
+    for (const line of readLines(name)) parser.ingest(JSON.parse(line));
+  }
+  assert.equal(events.filter(e => e.type === "text").map(e => e.text).join(""), "CHECK_OK");
+  assert.equal(events.filter(e => e.type === "tool_start").length, 1);
+  const updates = events.filter(e => e.type === "tool_update");
+  const completed = updates.filter(e => e.status === "completed");
+  assert.equal(completed.length, 1, "waiting for approval must not count as completed");
+  assert.equal(completed[0].rawOutput.metadata.output, "/tmp/approval-workspace\n");
+  assert.equal(completed[0].rawOutput.metadata.exitCode, 0);
+});
+
+test("new elements arriving after a terminal message snapshot are still forwarded", () => {
+  const events = [];
+  const parser = new EventParser(event => events.push(event));
+  const frame = children => ({ type: "partial-message-data", messages: [{
+    id: "same-message", role: "assistant", status: "success", elements: [{ children }],
+  }] });
+  parser.ingest(frame([]));
+  parser.ingest(frame([{ id: "answer", type: "TEXT", content: "late answer", end: true }]));
+  parser.ingest(frame([{ id: "answer", type: "TEXT", content: "late answer", end: true }]));
+  assert.deepEqual(events, [{ type: "text", messageId: "same-message", text: "late answer" }]);
+});
+
+test("skipping history preserves the current answer when the first snapshot is already a submit", () => {
+  const events = [];
+  const parser = new EventParser(event => events.push(event), createParserState(), { skipInitialHistory: true });
+  const answer = (id, content) => ({ id, role: "assistant", status: "success", elements: [{
+    children: [{ id: `${id}-text`, type: "TEXT", content, end: true }],
+  }] });
+  parser.ingest({ type: "conversation-messages", snapshotVersion: { mutation: "submit" }, messages: [
+    { id: "old-user", role: "user" }, answer("old", "old answer"),
+    { id: "new-user", role: "user" }, answer("new", "current answer"),
+  ] });
+  assert.deepEqual(events, [{ type: "text", messageId: "new", text: "current answer" }]);
+});
+
+test("history stays suppressed if its element ids change or it receives partial snapshots", () => {
+  const events = [];
+  const parser = new EventParser(event => events.push(event), createParserState(), { skipInitialHistory: true });
+  const message = { id: "history", role: "assistant", status: "cancelled", elements: [{ children: [
+    { id: "old-element", type: "TEXT", content: "old answer", end: true },
+  ] }] };
+  parser.ingest({ type: "conversation-messages", messages: [message] });
+  message.elements[0].children[0].id = "regenerated-id";
+  parser.ingest({ type: "conversation-messages", messages: [message] });
+  parser.ingest({ type: "partial-message-data", messages: [{ ...message,
+    tokenUsage: { contextUsed: 100, contextLimit: 1000 }, performanceMetrics: { firstTokenLatency: 100 },
+  }] });
+  parser.ingest({ type: "partial-message-elements", messageData: message });
+  assert.deepEqual(events, []);
+});
+
+for (const expansion of ["before submit", "on submit", "after submit"]) {
+  test(`paginated history expanding ${expansion} is excluded from output and token estimates`, () => {
+    const events = [];
+    const state = createParserState();
+    const parser = new EventParser(event => events.push(event), state, { skipInitialHistory: true });
+    const answer = (id, content) => ({ id, role: "assistant", elements: [{ children: [
+      { id: `${id}-text`, type: "TEXT", content, end: true },
+    ] }] });
+    // Comate initially loads only the last three queries, then expands the
+    // window. The older pages must never become output of the new prompt.
+    const history = Array.from({ length: 5 }, (_, i) => [
+      { id: `user-${i}`, role: "user" }, answer(`assistant-${i}`, "old answer"),
+    ]).flat();
+    const recent = history.slice(4);
+    const current = [{ id: "current-user", role: "user" }, answer("current-answer", "RECONNECT_OK")];
+    const snapshot = (mutation, messages) => parser.ingest({
+      type: "conversation-messages", snapshotVersion: { mutation }, messages,
+    });
+    if (expansion === "before submit") snapshot("refresh", []);
+    snapshot("refresh", recent);
+    if (expansion === "before submit") snapshot("refresh", history);
+    snapshot("submit", [...(expansion === "on submit" ? history : recent), ...current]);
+    snapshot("refresh", [...history, ...current]);
+    parser.ingest({ type: "partial-message-data", messages: [{ ...history[1],
+      tokenUsage: { contextUsed: 999, contextLimit: 1000 },
+      performanceMetrics: { firstTokenLatency: 999, totalDuration: 999 },
+    }] });
+    assert.deepEqual(events, [{ type: "text", messageId: "current-answer", text: "RECONNECT_OK" }]);
+    assert.equal(parser.estimatedOutputTokens(), 3);
+
+    // Approval restarts share the same prompt boundary, even if another old
+    // page is first encountered by the new CLI process.
+    const resumed = new EventParser(event => events.push(event), state);
+    resumed.ingest({ type: "conversation-messages", messages: [
+      answer("even-older", "old answer"), ...history, ...current,
+    ] });
+    assert.equal(events.length, 1);
+    assert.equal(resumed.estimatedOutputTokens(), 0);
+  });
+}
+
+test("tool output changes stream even when the tool status stays the same", () => {
+  const events = [];
+  const parser = new EventParser(event => events.push(event));
+  const frame = output => ({ type: "partial-message-elements", messageData: { id: "message", elements: [{ children: [{
+    id: "tool", type: "TOOL", toolName: "run_command", toolState: "executing", result: { metadata: { state: "running", output } },
+  }] }] } });
+  parser.ingest(frame("first\n"));
+  parser.ingest(frame("first\nsecond\n"));
+  parser.ingest(frame("first\nsecond\n"));
+  const updates = events.filter(e => e.type === "tool_update");
+  assert.deepEqual(updates.map(e => e.rawOutput.metadata.output), ["first\n", "first\nsecond\n"]);
 });
 
 test("parser ignores malformed and unknown frames", () => {

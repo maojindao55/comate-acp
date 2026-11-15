@@ -42,24 +42,21 @@ export interface RequiresActionPayload {
   payload?: unknown;
 }
 
-interface ElementState {
-  emitted: number;
-  ended: boolean;
-}
-
 interface ToolState {
   status: ToolStatus;
-  started: boolean;
+  output?: string;
 }
 
-/** Cross-turn bookkeeping, so a resumed turn does not replay what was sent. */
+/** Shared by every CLI invocation within one ACP prompt, including approvals. */
 export interface ParserState {
   emittedLength: Map<string, number>;
   endedElements: Set<string>;
-  tools: Map<string, { status: ToolStatus; started: boolean }>;
-  /** Messages already finished; a later sighting of one is a replay. */
-  closedMessages: Set<string>;
-  /** Latest performance counters, carried across turns of one session. */
+  tools: Map<string, ToolState>;
+  /** Messages loaded before this prompt was submitted, never current output. */
+  historyMessages: Set<string>;
+  /** Boundary retained across approval restarts and history page expansion. */
+  promptUserId?: string;
+  /** Latest performance counters for this prompt. */
   turnMetrics?: TurnMetrics;
   lastUsage?: { used: number; size: number };
 }
@@ -69,11 +66,9 @@ export function createParserState(): ParserState {
     emittedLength: new Map(),
     endedElements: new Set(),
     tools: new Map(),
-    closedMessages: new Set(),
+    historyMessages: new Set(),
   };
 }
-
-const TERMINAL_MESSAGE_STATUS = new Set(["success", "failed", "cancelled", "executed"]);
 
 const TOOL_STATE_TO_STATUS: Record<string, ToolStatus> = {
   pending: "pending",
@@ -82,11 +77,15 @@ const TOOL_STATE_TO_STATUS: Record<string, ToolStatus> = {
   failed: "failed",
 };
 
+const COMMAND_STATE_TO_STATUS: Record<string, ToolStatus> = {
+  pending: "pending", running: "in_progress", completed: "completed", failed: "failed",
+};
+
 export class EventParser {
   private readonly emittedLength: Map<string, number>;
   private readonly endedElements: Set<string>;
   private readonly tools: Map<string, ToolState>;
-  private readonly closedMessages: Set<string>;
+  private skipInitialHistory: boolean;
   /** Generated characters this turn, split by script, for the token estimate. */
   private cjkChars = 0;
   private otherChars = 0;
@@ -94,6 +93,7 @@ export class EventParser {
   constructor(
     private readonly emit: (event: ParserEvent) => void,
     private readonly state: ParserState = createParserState(),
+    options: { skipInitialHistory?: boolean } = {},
   ) {
     // The same conversation is replayed in full when a suspended turn resumes,
     // so the bookkeeping has to outlive a single process to avoid re-sending
@@ -101,7 +101,7 @@ export class EventParser {
     this.emittedLength = state.emittedLength;
     this.endedElements = state.endedElements;
     this.tools = state.tools;
-    this.closedMessages = state.closedMessages;
+    this.skipInitialHistory = options.skipInitialHistory ?? false;
   }
 
   /** Consumes one parsed JSON object from the event stream. */
@@ -119,9 +119,37 @@ export class EventParser {
     }
 
     switch (kind) {
-      case "conversation-messages":
+      case "conversation-messages": {
+        if (Array.isArray(frame.messages)) {
+          // Comate initially loads a window of recent queries. Older pages
+          // can appear in later snapshots, even after the new query starts.
+          const mutation = (frame.snapshotVersion as Record<string, unknown> | undefined)?.mutation;
+          let historyCount = 0;
+          if (this.skipInitialHistory) {
+            historyCount = frame.messages.length;
+            if (mutation === "submit") {
+              this.skipInitialHistory = false;
+              let latestUser = -1;
+              for (let i = 0; i < frame.messages.length; i += 1) {
+                if (frame.messages[i]?.role === "user") latestUser = i;
+              }
+              historyCount = Math.max(0, latestUser);
+              this.state.promptUserId = frame.messages[latestUser]?.id;
+            }
+          } else if (this.state.promptUserId) {
+            historyCount = Math.max(0, frame.messages.findIndex(message => message?.id === this.state.promptUserId));
+          }
+          // Approval resumes reuse the current assistant message. Only the
+          // messages BEFORE this prompt's user message are historical.
+          for (const message of frame.messages.slice(0, historyCount)) {
+            if (message && typeof message === "object" && typeof message.id === "string") {
+              this.state.historyMessages.add(message.id);
+            }
+          }
+        }
         this.ingestMessageList(frame.messages);
         return;
+      }
       case "partial-message-data": {
         this.ingestMessageList(frame.messages);
         this.ingestUsage(frame.messages);
@@ -131,8 +159,7 @@ export class EventParser {
         const messageData = frame.messageData as Record<string, unknown> | undefined;
         if (!messageData) return;
         const id = messageData.id as string | undefined;
-        // Deltas for a message we already finished belong to a replayed turn.
-        if (id && this.state.closedMessages.has(id)) return;
+        if (id && this.state.historyMessages.has(id)) return;
         if (id) this.ingestElements(id, messageData.elements);
         return;
       }
@@ -189,12 +216,10 @@ export class EventParser {
       const id = message.id as string | undefined;
       if (!id) continue;
 
-      const isHistory = this.state.closedMessages.has(id);
-      // Terminal states vary: a normal finish is `success`, but a turn whose
-      // stream was cut short is recorded as `cancelled`. Either way the message
-      // is done and any later sighting of it is a replay.
-      if (TERMINAL_MESSAGE_STATUS.has(message.status as string)) this.state.closedMessages.add(id);
-      if (isHistory) continue;
+      // success/cancelled are also used for approval checkpoints, and final
+      // content can arrive in a later terminal snapshot. Dedupe elements, not
+      // whole current messages, regardless of their temporary status.
+      if (this.state.historyMessages.has(id)) continue;
 
       this.ingestElements(id, message.elements);
     }
@@ -205,6 +230,7 @@ export class EventParser {
     for (const entry of messages) {
       if (!entry || typeof entry !== "object") continue;
       const message = entry as Record<string, unknown>;
+      if (this.state.historyMessages.has(message.id as string)) continue;
       this.ingestPerformance(message.performanceMetrics);
       const usage = message.tokenUsage;
       if (!usage || typeof usage !== "object") continue;
@@ -289,11 +315,16 @@ export class EventParser {
   private ingestTool(messageId: string, toolCallId: string, element: Record<string, unknown>): void {
     const toolName = typeof element.toolName === "string" ? element.toolName : "tool";
     const rawState = typeof element.toolState === "string" ? element.toolState : "pending";
-    const status = TOOL_STATE_TO_STATUS[rawState] ?? "pending";
+    const metadata = (element.result as { metadata?: { state?: string } } | undefined)?.metadata;
+    // run_command briefly reports toolState=executed even though it is only
+    // waiting for approval. The result metadata describes actual execution.
+    const status = (toolName === "run_command" ? COMMAND_STATE_TO_STATUS[metadata?.state ?? ""] : undefined)
+      ?? TOOL_STATE_TO_STATUS[rawState] ?? "pending";
+    const output = JSON.stringify(element.result);
 
     let state = this.tools.get(toolCallId);
     if (!state) {
-      state = { status, started: true };
+      state = { status: "pending", output: status === "pending" ? output : undefined };
       this.tools.set(toolCallId, state);
       this.emit({
         type: "tool_start",
@@ -306,8 +337,9 @@ export class EventParser {
       if (status === "pending") return;
     }
 
-    if (state.status === status) return;
+    if (state.status === status && state.output === output) return;
     state.status = status;
+    state.output = output;
     this.emit({
       type: "tool_update",
       messageId,

@@ -247,6 +247,21 @@ async function mcpAgent(t, extraEnv = {}) {
   };
 }
 
+test("a Windows npm .cmd installation supports ACP prompts with injected host MCP", { timeout: 10000 }, async t => {
+  const prefix = mkdtempSync(join(tmpdir(), "comate-windows npm-"));
+  const pkg = join(prefix, "node_modules", "@comate", "comatecli");
+  mkdirSync(join(pkg, "bin"), { recursive: true });
+  writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "@comate/comatecli", bin: { comatecli: "./bin/zulu-tui.mjs" } }));
+  writeFileSync(join(pkg, "bin", "zulu-tui.mjs"), readFileSync(FAKE));
+  const shim = join(prefix, "comatecli.cmd"); writeFileSync(shim, "@echo off\r\n");
+  t.after(() => rmSync(prefix, { recursive: true, force: true }));
+  const agent = await mcpAgent(t, { COMATE_ACP_CMD: shim });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [mcpServer("host", "windows-token")] });
+  assert.equal((await agent.prompt(sessionId)).stopReason, "end_turn");
+  assert.equal(agent.runs()[0].config.mcpServers.host.env.HOST_TOKEN, "windows-token");
+  assert.ok(agent.notifications.some(message => message.params?.update?.sessionUpdate === "agent_message_chunk"));
+});
+
 test("MCP injection survives turns, replaces on load, clears with an empty list, and never enters session storage", { timeout: 10000 }, async (t) => {
   const agent = await mcpAgent(t);
   mkdirSync(join(agent.cwd, ".comate"));
@@ -303,6 +318,50 @@ test("approval resume receives the same host MCP configuration", { timeout: 1000
   assert.ok(runs.every(run => run.config.mcpServers.host.env.HOST_TOKEN === "approval-token"));
   assert.ok(await waitFor(() => runs.every(run => !existsSync(run.overlay))));
 });
+
+test("command approval forwards the resumed message body and actual command result over ACP", { timeout: 10000 }, async (t) => {
+  const agent = await mcpAgent(t, {
+    FAKE_FIXTURE: new URL("./fixtures/command-suspend.jsonl", import.meta.url).pathname,
+    FAKE_RESUME_FIXTURE: new URL("./fixtures/command-resume.jsonl", import.meta.url).pathname,
+    FAKE_EXIT_CODE: "75",
+    FAKE_CLOSE_DELAY_MS: "200",
+  });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [mcpServer("host", "approval-token")] });
+  const prompt = agent.prompt(sessionId);
+  const ask = await waitFor(() => agent.notifications.find(message => message.method === "session/request_permission"));
+  assert.ok(ask);
+  assert.throws(() => process.kill(agent.runs()[0].pid, 0), { code: "ESRCH" }, "approval waits for the suspended CLI to close");
+  const updates = () => agent.notifications.filter(n => n.method === "session/update").map(n => n.params.update);
+  assert.equal(updates().some(u => u.sessionUpdate === "tool_call_update" && u.status === "completed"), false);
+  agent.reply(ask.id, { outcome: { outcome: "selected", optionId: "allow_once" } });
+  assert.equal((await prompt).stopReason, "end_turn");
+  assert.equal(updates().filter(u => u.sessionUpdate === "agent_message_chunk").map(u => u.content.text).join(""), "CHECK_OK");
+  assert.equal(updates().filter(u => u.sessionUpdate === "tool_call").length, 1);
+  const completed = updates().filter(u => u.sessionUpdate === "tool_call_update" && u.status === "completed");
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].rawOutput.metadata.output, "/tmp/approval-workspace\n");
+  assert.equal(agent.runs().length, 2);
+});
+
+for (const reconnect of [false, true]) {
+  test(`a continued prompt streams only the new answer (${reconnect ? "new adapter process" : "same connection"})`, { timeout: 10000 }, async (t) => {
+    const env = {
+      FAKE_FIXTURE: new URL("./fixtures/multiturn-1.jsonl", import.meta.url).pathname,
+      FAKE_CONTINUE_FIXTURE: new URL("./fixtures/multiturn-2.jsonl", import.meta.url).pathname,
+    };
+    const first = await mcpAgent(t, env);
+    const { sessionId } = await first.request("session/new", { cwd: first.cwd, mcpServers: [] });
+    await first.prompt(sessionId);
+    const answer = notifications => notifications.filter(n => n.method === "session/update"
+      && n.params.update.sessionUpdate === "agent_message_chunk").map(n => n.params.update.content.text).join("");
+    assert.equal(answer(first.notifications), "A");
+    const next = reconnect ? await mcpAgent(t, { ...env, COMATE_ACP_HOME: first.home }) : first;
+    await next.request("session/load", { sessionId, cwd: next.cwd, mcpServers: [] });
+    const before = next.notifications.length;
+    await next.prompt(sessionId);
+    assert.equal(answer(next.notifications.slice(before)), "B");
+  });
+}
 
 test("MCP snapshots are cleaned up when the CLI fails", { timeout: 10000 }, async (t) => {
   const agent = await mcpAgent(t, { FAKE_EXIT_CODE: "1" });

@@ -1,20 +1,5 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { delimiter, isAbsolute, resolve } from "node:path";
-
-function nodeLauncher(executable: string, env: NodeJS.ProcessEnv): string | undefined {
-  const candidates = isAbsolute(executable) || /[/\\]/.test(executable)
-    ? [resolve(executable)]
-    : (env.PATH ?? "").split(delimiter).map((dir) => resolve(dir, executable));
-  for (const candidate of candidates) {
-    try {
-      const real = realpathSync(candidate);
-      if (/\.(mjs|cjs|js)$/i.test(real)) return real;
-      return undefined;
-    } catch { /* Try the next PATH entry. */ }
-  }
-  return undefined;
-}
+import { resolveComateNodeLauncher } from "./comateExecutable.js";
 
 /**
  * comatecli ships both as a native binary and as a JS launcher
@@ -27,13 +12,14 @@ export function spawnComate(
   options: SpawnOptions,
   preload?: string,
 ): ChildProcess {
-  if (preload) {
-    const launcher = nodeLauncher(executable, options.env ?? process.env);
-    if (!launcher) {
-      throw new Error("Client MCP injection requires the npm Node.js version of comatecli. Install @comate/comatecli and point COMATE_ACP_CMD to its bin/zulu-tui.mjs launcher.");
-    }
-    return spawn(process.execPath, ["--require", preload, launcher, ...args], options);
+  const spawnOptions = { windowsHide: process.platform === "win32", ...options };
+  const launcher = resolveComateNodeLauncher(executable, options.env ?? process.env);
+  if (launcher) {
+    return spawn(process.execPath, [...(preload ? ["--require", preload] : []), launcher, ...args], spawnOptions);
   }
-  if (!/\.(mjs|cjs|js)$/i.test(executable)) return spawn(executable, args, options);
-  return spawn(process.execPath, [executable, ...args], options);
+  if (preload) {
+    throw new Error("Client MCP injection requires the npm Node.js version of comatecli. Run npm install -g @comate/comatecli, or set COMATE_ACP_CMD to its bin/zulu-tui.mjs launcher.");
+  }
+  if (!/\.(mjs|cjs|js)$/i.test(executable)) return spawn(executable, args, spawnOptions);
+  return spawn(process.execPath, [executable, ...args], spawnOptions);
 }

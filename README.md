@@ -4,7 +4,7 @@ Agent Client Protocol (ACP) adapter that exposes the Baidu Comate (Zulu) CLI as
 an ACP agent, so any ACP client — Zed, `ab ACP`, or FreeBuddy — can drive it.
 
 ```bash
-npm install -g comate-acp
+npm install -g comate-acp @comate/comatecli
 comate-acp            # serves ACP over stdio
 comate-acp --login    # hands the terminal to `comatecli login`
 comate-acp --version
@@ -50,15 +50,23 @@ anything else → error (with the stderr tail attached).
 
 **Suspend arrives twice.** The first `requires_action` frame is a conversation
 snapshot with no `toolId`; the second carries it. The adapter merges them and
-only stops early once it can name the tool. If the richer frame never comes, the
-exit code closes the turn and `comatecli pending --json` fills in the details.
+waits for process close before requesting permission and starting a resume.
+If the richer frame never comes, `comatecli pending --json` fills in the details.
 
-**Dedupe bookkeeping outlives a single turn.** `event-stream` is not a pure
-delta feed — `conversation-messages` and `partial-message-data` repeat full
+**Dedupe bookkeeping spans every approval restart of one prompt.**
+`event-stream` is not a pure delta feed — `conversation-messages` and
+`partial-message-data` repeat full
 snapshots. Each parser keeps how much of every element was already forwarded and
-only emits the suffix; that state is shared across turns of one session, so a
-resumed conversation does not re-send what the client already has. `tokenUsage`
-is likewise only reported when it changes.
+only emits the suffix. Comate temporarily marks the current assistant message
+`success` or `cancelled` while waiting for approval, then appends to that same
+message on resume, so these statuses must not discard subsequent content.
+Each new user prompt starts fresh bookkeeping and suppresses loaded history,
+including after an ACP reconnect and when older pages expand in later snapshots.
+The prompt's user message remains the history boundary across approval restarts,
+so historical text never contributes to the output-token estimate. `tokenUsage` is likewise only
+reported when it changes. Command status follows the result's execution state;
+waiting for approval is pending, and output updates are forwarded even when
+the status stays the same.
 
 **`~/.comate/bin/comate` is not the CLI.** It is the Comate IDE (VS Code fork)
 launcher script, and it exits 0 silently when handed CLI arguments — which would
@@ -90,6 +98,12 @@ Client MCP injection requires the **npm Node.js distribution** of Comate
 (`npm install -g @comate/comatecli`). Native standalone binaries cannot load the
 Node preload and return an explicit error when client MCP servers are supplied.
 If needed, set `COMATE_ACP_CMD` to the npm package's `bin/zulu-tui.mjs` launcher.
+
+On Windows, the adapter resolves npm's `comatecli.cmd`, PowerShell and shell
+shims to the package's declared Node.js entry. It runs that entry directly with
+Node for model discovery, login and prompts, including MCP injection. The npm
+user prefix (`%APPDATA%\npm`) is also searched when the desktop PATH is stale;
+`COMATE_ACP_CMD` remains available for custom installations.
 
 ## Layout
 

@@ -152,6 +152,8 @@ interface TurnOptions {
   args: string[];
   client: AgentContext;
   signal: AbortSignal;
+  parserState: ParserState;
+  skipInitialHistory: boolean;
 }
 
 /** Child processes currently streaming a turn, keyed by ACP session id. */
@@ -215,7 +217,7 @@ function applyParserEvent(client: AgentContext, sessionId: string, event: Parser
  * pending approval, so the frame alone cannot be trusted.
  */
 function runTurn(options: TurnOptions): Promise<TurnOutcome> {
-  const { session, args, client, signal } = options;
+  const { session, args, client, signal, parserState, skipInitialHistory } = options;
 
   return new Promise<TurnOutcome>((resolve, reject) => {
     let child: ChildProcess;
@@ -232,7 +234,7 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
       reject(new RequestError(-32603, `无法启动 comatecli: ${(error as Error).message}`));
       return;
     }
-    // A suspend/cancel can resolve the turn before the process has exited.
+    // Cancellation can resolve the turn before the process has exited.
     // Keep its config alive until the process has actually closed its pipes.
     child.once("close", () => overlay?.dispose());
     // The CLI may close its input before a late permission answer arrives.
@@ -245,12 +247,11 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
     let linesSeen = 0;
     let conversationId = session.conversationId;
     let stderrTail = "";
-    // comatecli emits the suspend twice: first a snapshot-only frame, then the
-    // one carrying toolId. Merge them and only stop early once we can name the
-    // tool; otherwise the exit code below closes the turn.
+    // Merge the snapshot-only and detailed action frames, then wait for close
+    // so the next process cannot race this one's trailing message snapshots.
     let suspend: RequiresActionPayload | undefined;
     const liveApprovals = new Set<string>();
-    let turnMetrics: TurnMetrics = { ...parserStateFor(session.sessionId).turnMetrics };
+    let turnMetrics: TurnMetrics = { ...parserState.turnMetrics };
 
     const parser = new EventParser((event) => {
       if (event.type === "usage" || event.type === "thought" || event.type === "text"
@@ -261,7 +262,6 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
       if (event.type === "requires_action") {
         if (event.payload.conversationId) conversationId = event.payload.conversationId;
         suspend = { ...suspend, ...event.payload };
-        if (suspend.toolId) finish({ conversationId, requiresAction: suspend });
         return;
       }
       if (event.type === "live_approval") {
@@ -292,7 +292,7 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
         // A suspend also reports Completed; let the exit code decide instead.
         return;
       }
-    }, parserStateFor(session.sessionId));
+    }, parserState, { skipInitialHistory });
 
     const finish = (outcome: TurnOutcome) => {
       if (settled) return;
@@ -473,18 +473,6 @@ async function enrichPending(
 
 // --- agent -----------------------------------------------------------------
 
-/** Per-session parser bookkeeping, kept across turns of the same conversation. */
-const parserStates = new Map<string, ParserState>();
-
-function parserStateFor(sessionId: string): ParserState {
-  let state = parserStates.get(sessionId);
-  if (!state) {
-    state = createParserState();
-    parserStates.set(sessionId, state);
-  }
-  return state;
-}
-
 function currentSession(sessionId: string): SessionState {
   const stored = sessions.get(sessionId);
   if (!stored) throw new RequestError(-32602, `未知会话 ${sessionId}`);
@@ -606,8 +594,15 @@ const app = agent({ name: "comate-acp" })
       attachImages: images,
     });
 
+    // Keep dedupe across approval restarts, but start afresh for every user
+    // prompt. A normal continuation seeds its initial native history; a
+    // --approve/--reject restart must keep the current message writable.
+    const parserState = createParserState();
     for (let round = 0; round < MAX_APPROVAL_ROUNDS; round += 1) {
-      const outcome = await runTurn({ session, args, client: ctx.client, signal: ctx.signal });
+      const outcome = await runTurn({
+        session, args, client: ctx.client, signal: ctx.signal, parserState,
+        skipInitialHistory: round === 0 && Boolean(session.conversationId),
+      });
       if (outcome.conversationId) {
         session.conversationId = outcome.conversationId;
         persist(session);

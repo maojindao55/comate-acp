@@ -23,7 +23,7 @@ if (args[0] === "run" && process.env.FAKE_CALLS_FILE) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  appendFileSync(process.env.FAKE_CALLS_FILE, JSON.stringify({ args, config, overlay: process.env.COMATE_ACP_MCP_CONFIG }) + "\n");
+  appendFileSync(process.env.FAKE_CALLS_FILE, JSON.stringify({ pid: process.pid, args, config, overlay: process.env.COMATE_ACP_MCP_CONFIG }) + "\n");
 }
 if (args[0] === "run" && process.env.FAKE_RUN_DELAY_MS) {
   await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_RUN_DELAY_MS)));
@@ -55,7 +55,8 @@ if (args[0] === "run" && process.env.FAKE_LIVE_APPROVAL) {
 }
 
 const resuming = args.includes("--approve") || args.includes("--reject");
-const fixture = resuming ? process.env.FAKE_RESUME_FIXTURE ?? process.env.FAKE_FIXTURE : process.env.FAKE_FIXTURE;
+const fixture = resuming ? process.env.FAKE_RESUME_FIXTURE ?? process.env.FAKE_FIXTURE
+  : args.includes("-c") ? process.env.FAKE_CONTINUE_FIXTURE ?? process.env.FAKE_FIXTURE : process.env.FAKE_FIXTURE;
 if (!fixture) {
   process.stderr.write("fake comatecli: FAKE_FIXTURE not set\n");
   process.exit(2);
@@ -63,6 +64,9 @@ if (!fixture) {
 
 for (const line of readFileSync(fixture, "utf-8").split("\n")) {
   if (line.trim()) process.stdout.write(`${line}\n`);
+}
+if (!resuming && process.env.FAKE_CLOSE_DELAY_MS) {
+  await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CLOSE_DELAY_MS)));
 }
 // Noise that must never reach the JSON-RPC pipe.
 process.stderr.write(`fake comatecli: unrelated noise (exit ${exitCode})\n`);
