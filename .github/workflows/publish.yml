@@ -7,8 +7,39 @@ on:
   workflow_dispatch:
 
 jobs:
+  validate:
+    name: Validate adapter (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies and build
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run adapter regression tests
+        if: runner.os != 'Windows'
+        run: npm test
+
+      - name: Verify Windows npm launchers and MCP preload
+        if: runner.os == 'Windows'
+        run: node --test test/comate-executable.test.mjs
+
   create-release:
     name: Create GitHub Release
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -26,6 +57,7 @@ jobs:
 
   publish-npm:
     name: Publish to npm
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
