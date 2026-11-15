@@ -106,3 +106,18 @@ test("parser ignores malformed and unknown frames", () => {
   assert.deepEqual(events, [], "非终态/未知帧不应产出事件");
   assert.equal(parser.finished, false);
 });
+
+test("legacy MCP pending approvals emit live actions only for the current conversation", () => {
+  const events = [];
+  const parser = new EventParser(event => events.push(event));
+  const approval = { toolId: "tool-1", toolName: "use_mcp_tool", approvalKind: "legacy", params: { server_name: "host", tool_name: "echo" } };
+  parser.ingest({ type: "pending-approvals", conversationInfo: { id: "current" }, pendingApprovals: [
+    { ...approval, conversationId: "current" },
+    { ...approval, conversationId: "other" },
+    { ...approval, conversationId: "current", toolName: "run_command" },
+    null,
+  ] });
+  assert.deepEqual(events, [{ type: "live_approval", payload: {
+    conversationId: "current", toolId: "tool-1", toolName: "use_mcp_tool", payload: approval.params,
+  } }]);
+});

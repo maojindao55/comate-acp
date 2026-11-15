@@ -3,6 +3,7 @@ import { agent, ndJsonStream, PROTOCOL_VERSION, RequestError } from "@agentclien
 import type {
   AgentContext,
   ContentBlock,
+  McpServer,
   SessionConfigOption,
   SessionModeState,
   SessionUpdate,
@@ -34,6 +35,8 @@ import { ModelCatalog } from "./models.js";
 import { fetchPending } from "./pending.js";
 import { SessionStore } from "./sessionStore.js";
 import { spawnComate } from "./spawn.js";
+import { createMcpOverlay, validateMcpServers, type McpOverlay } from "./mcp.js";
+import { sendLiveDecision } from "./liveApproval.js";
 
 const { version: VERSION } = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
@@ -65,6 +68,18 @@ interface SessionState {
   model?: string;
   effort?: Effort;
   mode: ModeId;
+  mcpServers: McpServer[];
+}
+
+// Host MCP credentials and ephemeral bridge endpoints only live on this ACP connection.
+const sessionMcpServers = new Map<string, McpServer[]>();
+
+function readMcpServers(servers?: McpServer[]): McpServer[] {
+  try {
+    return validateMcpServers(servers);
+  } catch (error) {
+    throw new RequestError(-32602, (error as Error).message);
+  }
 }
 
 function sanitizeCwd(cwd: unknown): string {
@@ -204,16 +219,25 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
 
   return new Promise<TurnOutcome>((resolve, reject) => {
     let child: ChildProcess;
+    let overlay: McpOverlay | undefined;
     try {
+      overlay = createMcpOverlay(session.mcpServers, session.cwd);
       child = spawnComate(EXECUTABLE, args, {
         cwd: session.cwd,
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+        env: overlay ? { ...process.env, ...overlay.env } : process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+      }, overlay?.preload);
     } catch (error) {
+      overlay?.dispose();
       reject(new RequestError(-32603, `无法启动 comatecli: ${(error as Error).message}`));
       return;
     }
+    // A suspend/cancel can resolve the turn before the process has exited.
+    // Keep its config alive until the process has actually closed its pipes.
+    child.once("close", () => overlay?.dispose());
+    // The CLI may close its input before a late permission answer arrives.
+    // sendLiveDecision handles write callbacks; lifecycle errors use close.
+    child.stdin?.on("error", () => {});
 
     active.set(session.sessionId, child);
     logDebug("spawn:", EXECUTABLE, args.join(" "));
@@ -225,6 +249,7 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
     // one carrying toolId. Merge them and only stop early once we can name the
     // tool; otherwise the exit code below closes the turn.
     let suspend: RequiresActionPayload | undefined;
+    const liveApprovals = new Set<string>();
     let turnMetrics: TurnMetrics = { ...parserStateFor(session.sessionId).turnMetrics };
 
     const parser = new EventParser((event) => {
@@ -237,6 +262,25 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
         if (event.payload.conversationId) conversationId = event.payload.conversationId;
         suspend = { ...suspend, ...event.payload };
         if (suspend.toolId) finish({ conversationId, requiresAction: suspend });
+        return;
+      }
+      if (event.type === "live_approval") {
+        if (settled || liveApprovals.has(event.payload.toolId!)) return;
+        liveApprovals.add(event.payload.toolId!);
+        conversationId = event.payload.conversationId ?? conversationId;
+        void requestDecision(client, session.sessionId, event.payload).then(async decision => {
+          if (settled || cancelRequested.has(session.sessionId) || signal.aborted) return;
+          if (decision === "cancelled") {
+            child.kill("SIGTERM");
+            finish({ conversationId, cancelled: true });
+            return;
+          }
+          await sendLiveDecision(child, event.payload, decision);
+        }).catch(error => {
+          if (settled) return;
+          child.kill("SIGTERM");
+          fail(`MCP 审批失败: ${(error as Error).message}`);
+        });
         return;
       }
       if (event.type === "turn_metrics") {
@@ -451,6 +495,7 @@ function currentSession(sessionId: string): SessionState {
     model: stored.model,
     effort: stored.effort as Effort | undefined,
     mode: (stored.mode as ModeId | undefined) ?? DEFAULT_MODE_ID,
+    mcpServers: sessionMcpServers.get(sessionId) ?? [],
   };
 }
 
@@ -473,6 +518,7 @@ const app = agent({ name: "comate-acp" })
     agentInfo: { name: "comate-acp", title: "Baidu Comate", version: VERSION },
     agentCapabilities: {
       loadSession: true,
+      mcpCapabilities: { http: true, sse: true },
       promptCapabilities: { embeddedContext: true },
       sessionCapabilities: { list: {}, close: {}, delete: {} },
     },
@@ -486,11 +532,13 @@ const app = agent({ name: "comate-acp" })
   }))
   .onRequest("session/new", async (ctx) => {
     const sessionId = crypto.randomUUID();
+    const mcpServers = readMcpServers(ctx.params.mcpServers);
     await models.refresh();
     const session: SessionState = {
       sessionId,
       cwd: sanitizeCwd(ctx.params.cwd),
       mode: DEFAULT_MODE_ID,
+      mcpServers,
     };
     sessions.put({
       sessionId,
@@ -499,9 +547,11 @@ const app = agent({ name: "comate-acp" })
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
+    sessionMcpServers.set(sessionId, mcpServers);
     return { sessionId, modes: modeState(session.mode), configOptions: buildConfigOptions(session) };
   })
   .onRequest("session/load", async (ctx) => {
+    const mcpServers = readMcpServers(ctx.params.mcpServers);
     await models.refresh();
     const stored = sessions.get(ctx.params.sessionId);
     const session: SessionState = {
@@ -511,6 +561,7 @@ const app = agent({ name: "comate-acp" })
       model: stored?.model,
       effort: (stored?.effort as Effort | undefined),
       mode: (stored?.mode as ModeId | undefined) ?? DEFAULT_MODE_ID,
+      mcpServers,
     };
     sessions.put({
       sessionId: session.sessionId,
@@ -522,15 +573,18 @@ const app = agent({ name: "comate-acp" })
       createdAt: stored?.createdAt ?? Date.now(),
       updatedAt: Date.now(),
     });
+    sessionMcpServers.set(session.sessionId, mcpServers);
     return { modes: modeState(session.mode), configOptions: buildConfigOptions(session) };
   })
   .onRequest("session/list", async () => ({
     sessions: sessions.list().map((s) => ({ sessionId: s.sessionId, cwd: s.cwd })),
   }))
   .onRequest("session/delete", async (ctx) => {
+    sessionMcpServers.delete(ctx.params.sessionId);
     sessions.delete(ctx.params.sessionId);
   })
   .onRequest("session/close", async (ctx) => {
+    sessionMcpServers.delete(ctx.params.sessionId);
     const child = active.get(ctx.params.sessionId);
     if (child) child.kill("SIGTERM");
   })

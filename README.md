@@ -68,6 +68,29 @@ look like an empty successful turn. The resolver therefore only probes
 **comatecli ships as a native binary or a JS launcher.** A `.mjs` launcher has
 to be spawned through the current Node binary; `spawnComate` handles both.
 
+**Client MCP servers.** `session/new` and `session/load` accept stdio, HTTP and
+SSE MCP servers from the ACP host, including FreeBuddy's browser, skills and
+user-selected servers. Each CLI invocation receives a private snapshot of
+`.comate/mcp.local.json`, merged with the workspace's existing JSONC settings.
+The snapshot takes priority for injected server names. A Node preload redirects
+only configuration reads in that CLI process and its workers; it never writes
+to workspace or global MCP files. Concurrent sessions have separate snapshots,
+which are removed when their CLI process closes. MCP endpoints and credentials
+are not stored in `sessions.json`; loading a session replaces the previous host
+server list, including when the new list is empty.
+
+Comate 2.0 emits legacy `pending-approvals` for MCP calls without suspending
+the CLI. The adapter forwards these to ACP permission requests, then uses
+Comate's JSON stdin router to approve or reject the tool in the running process.
+This router requires `ZULU_MOBILE_MODE=1` for injected turns; Comate labels these
+native history entries as `Mobile`. Command approvals continue to use the
+existing suspend/resume protocol.
+
+Client MCP injection requires the **npm Node.js distribution** of Comate
+(`npm install -g @comate/comatecli`). Native standalone binaries cannot load the
+Node preload and return an explicit error when client MCP servers are supplied.
+If needed, set `COMATE_ACP_CMD` to the npm package's `bin/zulu-tui.mjs` launcher.
+
 ## Layout
 
 - `src/index.ts` — ACP methods, event → `session/update` mapping, turn lifecycle
@@ -78,6 +101,8 @@ to be spawned through the current Node binary; `spawnComate` handles both.
 - `src/comateExecutable.ts` — resolves the `comatecli` binary
 - `src/sessionStore.ts` — persists ACP session → conversation id
 - `src/spawn.ts` — binary-vs-JS-launcher spawn helper
+- `src/mcp.ts`, `src/mcpPreload.cts` — session MCP configuration and process-scoped reads
+- `src/liveApproval.ts` — ACP decisions for Comate's live MCP approval channel
 
 ## Testing
 

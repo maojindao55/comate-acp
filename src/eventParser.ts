@@ -23,6 +23,7 @@ export type ParserEvent =
   | { type: "usage"; used: number; size: number }
   | { type: "turn_metrics"; firstTokenLatencyMs?: number; modelCallDurationMs?: number }
   | { type: "requires_action"; payload: RequiresActionPayload }
+  | { type: "live_approval"; payload: RequiresActionPayload }
   | { type: "turn_end"; status: "completed" | "failed" | "cancelled"; conversationId?: string }
   | { type: "error"; message: string };
 
@@ -113,6 +114,9 @@ export class EventParser {
     if (!this.observedConversationId && typeof info?.id === "string") {
       this.observedConversationId = info.id;
     }
+    if (!this.observedConversationId && kind === "conv_ready" && typeof frame.conversationId === "string") {
+      this.observedConversationId = frame.conversationId;
+    }
 
     switch (kind) {
       case "conversation-messages":
@@ -148,6 +152,20 @@ export class EventParser {
           },
         });
         return;
+      case "pending-approvals": {
+        if (!Array.isArray(frame.pendingApprovals)) return;
+        for (const entry of frame.pendingApprovals) {
+          if (!entry || typeof entry !== "object") continue;
+          const action = entry as Record<string, unknown>;
+          if (action.toolName !== "use_mcp_tool" || action.approvalKind !== "legacy" || typeof action.toolId !== "string") continue;
+          const conversationId = typeof action.conversationId === "string" ? action.conversationId : this.observedConversationId;
+          if (!conversationId || (this.observedConversationId && conversationId !== this.observedConversationId)) continue;
+          this.emit({ type: "live_approval", payload: {
+            conversationId, toolId: action.toolId, toolName: "use_mcp_tool", payload: action.params,
+          } });
+        }
+        return;
+      }
       case "conversation-status": {
         const info = frame.conversationInfo as Record<string, unknown> | undefined;
         const status = info?.status;
@@ -158,7 +176,7 @@ export class EventParser {
         return;
       }
       default:
-        // `pending-approvals` and unknown future frames carry no turn output.
+        // Unknown future frames carry no turn output.
         return;
     }
   }
