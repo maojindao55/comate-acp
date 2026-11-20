@@ -1,6 +1,6 @@
 {
   "name": "comate-acp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Agent Client Protocol adapter that exposes the Baidu Comate (Zulu) CLI as an ACP agent",
   "main": "dist/index.js",
   "bin": {
