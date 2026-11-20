@@ -424,3 +424,136 @@ for (const decision of ["approve", "reject", "cancelled"]) {
     assert.ok(await waitFor(() => runs.every(run => !existsSync(run.overlay))));
   });
 }
+
+test("initialize advertises terminal auth when client supports it and agent auth otherwise", async () => {
+  const terminalClient = startAgent();
+  const basicClient = startAgent();
+  try {
+    const withTerminal = await terminalClient.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { auth: { terminal: true } },
+      clientInfo: { name: "freebuddy", version: "0.10.65" },
+    });
+    assert.deepEqual(withTerminal.agentCapabilities.auth, { logout: {} });
+    assert.equal(withTerminal.authMethods[0].id, "comate-login");
+    assert.equal(withTerminal.authMethods[0].type, "terminal");
+    assert.deepEqual(withTerminal.authMethods[0].args, ["--login"]);
+
+    const withoutTerminal = await basicClient.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {},
+      clientInfo: { name: "basic-client", version: "0.0.0" },
+    });
+    assert.equal(withoutTerminal.authMethods[0].id, "comate-login");
+    assert.equal(withoutTerminal.authMethods[0].type, undefined);
+  } finally {
+    terminalClient.child.kill("SIGKILL");
+    basicClient.child.kill("SIGKILL");
+  }
+});
+
+test("missing Comate license or token returns ACP authRequired (-32000)", async () => {
+  const agent = startAgent({
+    FAKE_FIXTURE: TEXT_FIXTURE,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: "Error: No license or token provided.\nTips：可进入如流群（12199111）获得帮助\n",
+  });
+  try {
+    await agent.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { auth: { terminal: true } },
+    });
+    const created = await agent.request("session/new", { cwd: "/tmp", mcpServers: [] });
+    await assert.rejects(
+      agent.request("session/prompt", {
+        sessionId: created.sessionId,
+        prompt: [{ type: "text", text: "nihao" }],
+      }),
+      (error) => {
+        const parsed = JSON.parse(error.message);
+        assert.equal(parsed.code, -32000);
+        assert.match(parsed.message, /No license or token provided/);
+        return true;
+      },
+    );
+  } finally {
+    agent.child.kill("SIGKILL");
+  }
+});
+
+test("authenticate checks comatecli status, refreshes models, and rejects unauthenticated or unknown methods", async () => {
+  const authed = startAgent({
+    FAKE_STATUS_CODE: "0",
+    FAKE_MODELS_STDOUT: "  ERNIE 5.5  (ernie-5.5)\n",
+  });
+  const unauthed = startAgent({
+    FAKE_STATUS_CODE: "1",
+    FAKE_STATUS_STDOUT: "状态：未登录\n提示：运行 `comatecli login` 登录\n",
+  });
+  try {
+    await authed.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { auth: { terminal: true } },
+    });
+    await authed.request("authenticate", { methodId: "comate-login" });
+    const created = await authed.request("session/new", { cwd: "/tmp", mcpServers: [] });
+    const modelOption = created.configOptions.find((option) => option.id === "model");
+    assert.ok(modelOption.options.some((entry) => entry.value === "ernie-5.5"));
+
+    await assert.rejects(
+      authed.request("authenticate", { methodId: "unknown-method" }),
+      (error) => JSON.parse(error.message).code === -32602,
+    );
+
+    await unauthed.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { auth: { terminal: true } },
+    });
+    await assert.rejects(
+      unauthed.request("authenticate", { methodId: "comate-login" }),
+      (error) => {
+        const parsed = JSON.parse(error.message);
+        assert.equal(parsed.code, -32000);
+        assert.match(parsed.message, /未登录/);
+        return true;
+      },
+    );
+  } finally {
+    authed.child.kill("SIGKILL");
+    unauthed.child.kill("SIGKILL");
+  }
+});
+
+test("logout forwards to comatecli logout and --login forwards login args", async (t) => {
+  const logoutFile = join(tmpdir(), `comate-acp-logout-${process.pid}.jsonl`);
+  const loginFile = join(tmpdir(), `comate-acp-login-${process.pid}.jsonl`);
+  t.after(() => {
+    rmSync(logoutFile, { force: true });
+    rmSync(loginFile, { force: true });
+  });
+
+  const agent = startAgent({ FAKE_LOGOUT_FILE: logoutFile });
+  try {
+    await agent.request("initialize", {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: { auth: { terminal: true } },
+    });
+    await agent.request("logout", {});
+    const calls = readFileSync(logoutFile, "utf-8").trim().split("\n").map(JSON.parse);
+    assert.deepEqual(calls, [{ args: ["logout"] }]);
+  } finally {
+    agent.child.kill("SIGKILL");
+  }
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [SERVER, "--login", "--platform", "saas"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, COMATE_ACP_CMD: FAKE, FAKE_LOGIN_ARGS_FILE: loginFile },
+    });
+    child.on("error", reject);
+    child.on("close", resolve);
+  });
+  assert.equal(exitCode, 0);
+  const loginCalls = readFileSync(loginFile, "utf-8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(loginCalls, [{ args: ["login", "--platform", "saas"] }]);
+});

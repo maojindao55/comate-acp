@@ -14,6 +14,34 @@ import { createInterface } from "node:readline";
 const [, , ...args] = process.argv;
 const exitCode = Number(process.env.FAKE_EXIT_CODE ?? "0");
 
+if (args[0] === "status") {
+  const statusCode = Number(process.env.FAKE_STATUS_CODE ?? "0");
+  if (process.env.FAKE_STATUS_STDOUT) process.stdout.write(process.env.FAKE_STATUS_STDOUT);
+  if (process.env.FAKE_STATUS_STDERR) process.stderr.write(process.env.FAKE_STATUS_STDERR);
+  process.exit(statusCode);
+}
+
+if (args[0] === "logout") {
+  if (process.env.FAKE_LOGOUT_FILE) {
+    appendFileSync(process.env.FAKE_LOGOUT_FILE, JSON.stringify({ args }) + "\n");
+  }
+  const logoutCode = Number(process.env.FAKE_LOGOUT_CODE ?? "0");
+  if (process.env.FAKE_LOGOUT_STDERR) process.stderr.write(process.env.FAKE_LOGOUT_STDERR);
+  process.exit(logoutCode);
+}
+
+if (args[0] === "login") {
+  if (process.env.FAKE_LOGIN_ARGS_FILE) {
+    appendFileSync(process.env.FAKE_LOGIN_ARGS_FILE, JSON.stringify({ args }) + "\n");
+  }
+  process.exit(Number(process.env.FAKE_LOGIN_CODE ?? "0"));
+}
+
+if (args[0] === "model" && args[1] === "list") {
+  if (process.env.FAKE_MODELS_STDOUT) process.stdout.write(process.env.FAKE_MODELS_STDOUT);
+  process.exit(Number(process.env.FAKE_MODELS_CODE ?? "0"));
+}
+
 if (args[0] === "run" && process.env.FAKE_CALLS_FILE) {
   const cwd = args[args.indexOf("--cwd") + 1];
   const local = join(cwd, ".comate", "mcp.local.json");
@@ -69,5 +97,5 @@ if (!resuming && process.env.FAKE_CLOSE_DELAY_MS) {
   await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CLOSE_DELAY_MS)));
 }
 // Noise that must never reach the JSON-RPC pipe.
-process.stderr.write(`fake comatecli: unrelated noise (exit ${exitCode})\n`);
+process.stderr.write(process.env.FAKE_STDERR ?? `fake comatecli: unrelated noise (exit ${exitCode})\n`);
 process.exit(resuming && process.env.FAKE_RESUME_FIXTURE ? 0 : exitCode);

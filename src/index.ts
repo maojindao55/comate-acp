@@ -37,6 +37,14 @@ import { SessionStore } from "./sessionStore.js";
 import { spawnComate } from "./spawn.js";
 import { createMcpOverlay, validateMcpServers, type McpOverlay } from "./mcp.js";
 import { sendLiveDecision } from "./liveApproval.js";
+import {
+  buildAuthMethods,
+  buildLoginCliArgs,
+  checkComateAuthStatus,
+  COMATE_AUTH_METHOD_ID,
+  isComateAuthError,
+  logoutComate,
+} from "./auth.js";
 
 const { version: VERSION } = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
@@ -366,7 +374,14 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
         return;
       }
       const detail = stderrTail.trim();
-      fail(`comatecli 退出码 ${code}${detail ? `: ${detail}` : ""}`);
+      const message = `comatecli 退出码 ${code}${detail ? `: ${detail}` : ""}`;
+      if (isComateAuthError(detail)) {
+        settled = true;
+        active.delete(session.sessionId);
+        reject(RequestError.authRequired(undefined, message));
+        return;
+      }
+      fail(message);
     });
   });
 }
@@ -501,7 +516,7 @@ function persist(session: SessionState): void {
 }
 
 const app = agent({ name: "comate-acp" })
-  .onRequest("initialize", async () => ({
+  .onRequest("initialize", async (ctx) => ({
     protocolVersion: PROTOCOL_VERSION,
     agentInfo: { name: "comate-acp", title: "Baidu Comate", version: VERSION },
     agentCapabilities: {
@@ -509,15 +524,28 @@ const app = agent({ name: "comate-acp" })
       mcpCapabilities: { http: true, sse: true },
       promptCapabilities: { embeddedContext: true },
       sessionCapabilities: { list: {}, close: {}, delete: {} },
+      auth: { logout: {} },
     },
-    authMethods: [
-      {
-        id: "comate-login",
-        name: "Comate 登录",
-        description: "在终端运行 `comatecli login` 完成登录；已登录则可忽略。",
-      },
-    ],
+    authMethods: buildAuthMethods(ctx.params.clientCapabilities),
   }))
+  .onRequest("authenticate", async (ctx) => {
+    if (ctx.params.methodId !== COMATE_AUTH_METHOD_ID) {
+      throw RequestError.invalidParams(undefined, `不支持的认证方式: ${ctx.params.methodId}`);
+    }
+    const status = await checkComateAuthStatus(EXECUTABLE);
+    if (!status.authenticated) {
+      throw RequestError.authRequired(
+        undefined,
+        status.detail ?? "尚未登录 Comate，请在终端运行 `comatecli login` 完成登录。",
+      );
+    }
+    await models.refresh();
+    return {};
+  })
+  .onRequest("logout", async () => {
+    await logoutComate(EXECUTABLE);
+    return {};
+  })
   .onRequest("session/new", async (ctx) => {
     const sessionId = crypto.randomUUID();
     const mcpServers = readMcpServers(ctx.params.mcpServers);
@@ -667,7 +695,7 @@ const app = agent({ name: "comate-acp" })
 
 if (process.argv.includes("--login")) {
   // Terminal-auth entry point: hand the terminal to comatecli's own login flow.
-  const child = spawnComate(EXECUTABLE, ["login"], { stdio: "inherit" });
+  const child = spawnComate(EXECUTABLE, buildLoginCliArgs(process.argv.slice(2)), { stdio: "inherit" });
   child.on("error", (error) => {
     logError(`启动 comatecli login 失败: ${error.message}`);
     process.exit(1);
