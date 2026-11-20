@@ -12,8 +12,15 @@ export function spawnComate(
   options: SpawnOptions,
   preload?: string,
 ): ChildProcess {
-  const spawnOptions = { windowsHide: process.platform === "win32", ...options };
-  const launcher = resolveComateNodeLauncher(executable, options.env ?? process.env);
+  const baseEnv = options.env ?? process.env;
+  // comatecli headless CLIVirtualEditor omits applyDocumentEdits; ZULU_EDIT_PATCH_MODE=0
+  // routes edit_file through saveDocumentWithReplaceContent instead.
+  const env: NodeJS.ProcessEnv =
+    baseEnv.ZULU_EDIT_PATCH_MODE === undefined
+      ? { ...baseEnv, ZULU_EDIT_PATCH_MODE: "0" }
+      : baseEnv;
+  const spawnOptions = { windowsHide: process.platform === "win32", ...options, env };
+  const launcher = resolveComateNodeLauncher(executable, env);
   if (launcher) {
     return spawn(process.execPath, [...(preload ? ["--require", preload] : []), launcher, ...args], spawnOptions);
   }

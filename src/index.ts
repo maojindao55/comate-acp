@@ -35,6 +35,7 @@ import { ModelCatalog } from "./models.js";
 import { fetchPending } from "./pending.js";
 import { SessionStore } from "./sessionStore.js";
 import { spawnComate } from "./spawn.js";
+import { isGracefulExitCleanupError, StderrTail } from "./stderr.js";
 import { createMcpOverlay, validateMcpServers, type McpOverlay } from "./mcp.js";
 import { sendLiveDecision } from "./liveApproval.js";
 import {
@@ -125,6 +126,7 @@ function buildConfigOptions(session: SessionState): SessionConfigOption[] {
     {
       type: "select",
       id: "model",
+      category: "model",
       name: "模型",
       description: "comatecli -m",
       currentValue: session.model ?? "",
@@ -133,6 +135,7 @@ function buildConfigOptions(session: SessionState): SessionConfigOption[] {
     {
       type: "select",
       id: "effort",
+      category: "thought_level",
       name: "推理强度",
       description: "comatecli --effort",
       currentValue: session.effort ?? "",
@@ -254,7 +257,7 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
     let settled = false;
     let linesSeen = 0;
     let conversationId = session.conversationId;
-    let stderrTail = "";
+    const stderrTail = new StderrTail(4000);
     // Merge the snapshot-only and detailed action frames, then wait for close
     // so the next process cannot race this one's trailing message snapshots.
     let suspend: RequiresActionPayload | undefined;
@@ -340,7 +343,7 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
 
     child.stderr!.setEncoding("utf-8");
     child.stderr!.on("data", (chunk: string) => {
-      stderrTail = `${stderrTail}${chunk}`.slice(-4000);
+      stderrTail.push(chunk);
     });
 
     child.on("error", (error) => fail(`comatecli 启动失败: ${error.message}`));
@@ -373,7 +376,18 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
         finish({ conversationId, metrics: turnMetrics, estimatedOutputTokens });
         return;
       }
-      const detail = stderrTail.trim();
+      const detail = stderrTail.text();
+      if (
+        code === 1 &&
+        parser.turnStatus === "completed" &&
+        !suspend &&
+        !isComateAuthError(detail) &&
+        isGracefulExitCleanupError(detail)
+      ) {
+        logDebug("comatecli 回合已完成，忽略退出清理阶段错误:", detail);
+        finish({ conversationId, metrics: turnMetrics, estimatedOutputTokens });
+        return;
+      }
       const message = `comatecli 退出码 ${code}${detail ? `: ${detail}` : ""}`;
       if (isComateAuthError(detail)) {
         settled = true;

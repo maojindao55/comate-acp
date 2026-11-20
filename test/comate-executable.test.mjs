@@ -80,3 +80,24 @@ test("a native .exe override is not replaced by an adjacent npm install", t => {
   assert.equal(resolveComateNodeLauncher(exe), undefined);
   assert.throws(() => spawnComate(exe, [], {}, "/preload.cjs"), /npm Node.js version/);
 });
+
+test("spawnComate defaults ZULU_EDIT_PATCH_MODE to 0 and preserves explicit overrides", async t => {
+  const root = workspace(t);
+  const probe = join(root, "env-probe.mjs");
+  writeFileSync(probe, "process.stdout.write(JSON.stringify({ mode: process.env.ZULU_EDIT_PATCH_MODE ?? null }))");
+
+  const runProbe = async (env) => {
+    const child = spawnComate(probe, [], { env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", chunk => stdout += chunk);
+    child.stderr.on("data", chunk => stderr += chunk);
+    const code = await new Promise((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+    assert.equal(code, 0, stderr);
+    return JSON.parse(stdout);
+  };
+
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.ZULU_EDIT_PATCH_MODE;
+  assert.deepEqual(await runProbe(cleanEnv), { mode: "0" });
+  assert.deepEqual(await runProbe({ ...cleanEnv, ZULU_EDIT_PATCH_MODE: "1" }), { mode: "1" });
+});

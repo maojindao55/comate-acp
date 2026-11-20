@@ -17,9 +17,11 @@ const FAKE = new URL("./fake-comatecli.mjs", import.meta.url).pathname;
  */
 function startAgent(env = {}) {
   const home = mkdtempSync(join(tmpdir(), "comate-acp-e2e-"));
+  const baseEnv = { ...process.env };
+  delete baseEnv.ZULU_EDIT_PATCH_MODE;
   const child = spawn(process.execPath, [SERVER], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, COMATE_ACP_HOME: home, COMATE_ACP_CMD: FAKE, ...env },
+    env: { ...baseEnv, COMATE_ACP_HOME: home, COMATE_ACP_CMD: FAKE, ...env },
   });
   child.once("close", () => rmSync(home, { recursive: true, force: true }));
 
@@ -108,6 +110,10 @@ test("session/new then prompt streams chunks and ends the turn", async () => {
     const created = await agent.request("session/new", { cwd: "/tmp", mcpServers: [] });
     assert.ok(created.sessionId, "应返回 sessionId");
     assert.ok(Array.isArray(created.configOptions), "应返回 configOptions");
+    const modelOption = created.configOptions.find((option) => option.id === "model");
+    const effortOption = created.configOptions.find((option) => option.id === "effort");
+    assert.equal(modelOption?.category, "model");
+    assert.equal(effortOption?.category, "thought_level");
 
     const before = agent.notifications.length;
     const prompt = await agent.request("session/prompt", {
@@ -556,4 +562,111 @@ test("logout forwards to comatecli logout and --login forwards login args", asyn
   assert.equal(exitCode, 0);
   const loginCalls = readFileSync(loginFile, "utf-8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(loginCalls, [{ args: ["login", "--platform", "saas"] }]);
+});
+
+const GRACEFUL_EXIT_CLEANUP_STDERR = [
+  "2026-11-20T04:27:50.118Z [Langfuse SDK] [WARN] Span attribute langfuse.trace.metadata is not a stringified object. Skipping media handling.",
+  "2026-11-20T04:28:15.107Z [Langfuse SDK] [WARN] Span attribute langfuse.observation.metadata is not a stringified object. Skipping media handling.",
+  "Error during graceful exit:",
+  "Tips：可进入如流群（12199111）获得帮助",
+  " AggregateError: agent-core provider cleanup failed (2)",
+  "    at InProcessKernelProvider.disposeOnce (file:///C:/chunk.js:1027:809998) {",
+  "  [errors]: [",
+  "    AggregateError: RuntimeLifecycle 释放失败（1 个资源）",
+  "    AggregateError: ProcessSupervisor shutdown failed (1)",
+  "  ]",
+  "}",
+  "",
+].join("\n");
+
+test("completed turn tolerates post-turn graceful-exit cleanup error and persists conversationId", { timeout: 10000 }, async (t) => {
+  const first = await mcpAgent(t, {
+    FAKE_FIXTURE: new URL("./fixtures/multiturn-1.jsonl", import.meta.url).pathname,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: GRACEFUL_EXIT_CLEANUP_STDERR,
+  });
+  const { sessionId } = await first.request("session/new", { cwd: first.cwd, mcpServers: [] });
+  const firstResult = await first.prompt(sessionId);
+  assert.equal(firstResult.stopReason, "end_turn");
+  assert.equal(first.getStderr(), "", "tolerated post-turn cleanup failure must not emit stderr");
+
+  const stored = JSON.parse(readFileSync(join(first.home, "sessions.json"), "utf8"));
+  assert.equal(stored.sessions[sessionId]?.conversationId, "8824b9c4-2e9a-4a4e-8f1e-76654b0023a7");
+
+  const second = await mcpAgent(t, {
+    COMATE_ACP_HOME: first.home,
+    FAKE_CONTINUE_FIXTURE: new URL("./fixtures/multiturn-2.jsonl", import.meta.url).pathname,
+  });
+  await second.request("session/load", { sessionId, cwd: second.cwd, mcpServers: [] });
+  const secondResult = await second.prompt(sessionId);
+  assert.equal(secondResult.stopReason, "end_turn");
+  const runs = second.runs();
+  assert.equal(runs.length, 1);
+  const convArgIndex = runs[0].args.indexOf("-c");
+  assert.ok(convArgIndex >= 0);
+  assert.equal(runs[0].args[convArgIndex + 1], "8824b9c4-2e9a-4a4e-8f1e-76654b0023a7");
+});
+
+test("non-cleanup failure strips Langfuse SDK warnings and preserves real error", { timeout: 10000 }, async (t) => {
+  const agent = await mcpAgent(t, {
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: [
+      "2026-11-20T04:27:50.118Z [Langfuse SDK] [WARN] Span attribute langfuse.trace.metadata is not a stringified object. Skipping media handling.",
+      "2026-11-20T04:28:15.107Z [Langfuse SDK] [WARN] Span attribute langfuse.observation.metadata is not a stringified object. Skipping media handling.",
+      "Error: upstream timeout",
+      "",
+    ].join("\n"),
+  });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [] });
+  await assert.rejects(
+    agent.prompt(sessionId),
+    (error) => {
+      const parsed = JSON.parse(error.message);
+      assert.equal(parsed.code, -32603);
+      assert.match(parsed.message, /upstream timeout/);
+      assert.doesNotMatch(parsed.message, /\[Langfuse SDK\] \[WARN\]/);
+      return true;
+    },
+  );
+});
+
+test("graceful-exit cleanup error without Completed status still fails", { timeout: 10000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "comate-acp-incomplete-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const incompleteFixture = join(dir, "incomplete.jsonl");
+  writeFileSync(
+    incompleteFixture,
+    [
+      JSON.stringify({ type: "conversation-status", conversationInfo: { id: "incomplete-conv", status: "Running" } }),
+      JSON.stringify({ type: "conversation-status", conversationInfo: { id: "incomplete-conv", status: "Failed" } }),
+    ].join("\n") + "\n",
+  );
+
+  const agent = await mcpAgent(t, {
+    FAKE_FIXTURE: incompleteFixture,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: GRACEFUL_EXIT_CLEANUP_STDERR,
+  });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [] });
+  await assert.rejects(
+    agent.prompt(sessionId),
+    (error) => {
+      const parsed = JSON.parse(error.message);
+      assert.equal(parsed.code, -32603);
+      assert.match(parsed.message, /agent-core provider cleanup failed/);
+      return true;
+    },
+  );
+});
+
+test("E2E runs default ZULU_EDIT_PATCH_MODE to 0 and respect explicit override", { timeout: 10000 }, async (t) => {
+  const defaultAgent = await mcpAgent(t);
+  const { sessionId: sid1 } = await defaultAgent.request("session/new", { cwd: defaultAgent.cwd, mcpServers: [] });
+  await defaultAgent.prompt(sid1);
+  assert.equal(defaultAgent.runs()[0].editPatchMode, "0");
+
+  const overrideAgent = await mcpAgent(t, { ZULU_EDIT_PATCH_MODE: "1" });
+  const { sessionId: sid2 } = await overrideAgent.request("session/new", { cwd: overrideAgent.cwd, mcpServers: [] });
+  await overrideAgent.prompt(sid2);
+  assert.equal(overrideAgent.runs()[0].editPatchMode, "1");
 });

@@ -230,3 +230,29 @@ test("legacy MCP pending approvals emit live actions only for the current conver
     conversationId: "current", toolId: "tool-1", toolName: "use_mcp_tool", payload: approval.params,
   } }]);
 });
+
+test("turnStatus tracks completed/failed/cancelled and resets on Running", () => {
+  const events = [];
+  const parser = new EventParser((event) => events.push(event));
+  assert.equal(parser.turnStatus, undefined);
+
+  parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Running" } });
+  assert.equal(parser.turnStatus, undefined);
+  assert.equal(parser.finished, false);
+
+  parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Completed" } });
+  assert.equal(parser.turnStatus, "completed");
+  assert.equal(parser.finished, true);
+
+  parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Running" } });
+  assert.equal(parser.turnStatus, undefined);
+  assert.equal(parser.finished, false);
+
+  parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Failed" } });
+  assert.equal(parser.turnStatus, "failed");
+  assert.equal(parser.finished, true);
+
+  parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Cancelled" } });
+  assert.equal(parser.turnStatus, "cancelled");
+  assert.equal(parser.finished, true);
+});

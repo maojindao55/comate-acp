@@ -197,7 +197,10 @@ export class EventParser {
         const info = frame.conversationInfo as Record<string, unknown> | undefined;
         const status = info?.status;
         const conversationId = info?.id as string | undefined;
-        if (status === "Completed") this.endTurn("completed", conversationId);
+        if (status === "Running") {
+          this.turnEnded = false;
+          this.lastTurnStatus = undefined;
+        } else if (status === "Completed") this.endTurn("completed", conversationId);
         else if (status === "Failed") this.endTurn("failed", conversationId);
         else if (status === "Cancelled") this.endTurn("cancelled", conversationId);
         return;
@@ -367,10 +370,17 @@ export class EventParser {
     return this.turnEnded;
   }
 
+  /** Latest terminal status from `conversation-status` (reset on `Running`). */
+  get turnStatus(): "completed" | "failed" | "cancelled" | undefined {
+    return this.lastTurnStatus;
+  }
+
   private turnEnded = false;
+  private lastTurnStatus: "completed" | "failed" | "cancelled" | undefined;
 
   private endTurn(status: "completed" | "failed" | "cancelled", conversationId?: string): void {
     this.turnEnded = true;
+    this.lastTurnStatus = status;
     this.emit({ type: "turn_end", status, conversationId });
   }
 }

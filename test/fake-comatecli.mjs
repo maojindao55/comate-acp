@@ -51,7 +51,13 @@ if (args[0] === "run" && process.env.FAKE_CALLS_FILE) {
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  appendFileSync(process.env.FAKE_CALLS_FILE, JSON.stringify({ pid: process.pid, args, config, overlay: process.env.COMATE_ACP_MCP_CONFIG }) + "\n");
+  appendFileSync(process.env.FAKE_CALLS_FILE, JSON.stringify({
+    pid: process.pid,
+    args,
+    config,
+    overlay: process.env.COMATE_ACP_MCP_CONFIG,
+    editPatchMode: process.env.ZULU_EDIT_PATCH_MODE ?? null,
+  }) + "\n");
 }
 if (args[0] === "run" && process.env.FAKE_RUN_DELAY_MS) {
   await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_RUN_DELAY_MS)));
