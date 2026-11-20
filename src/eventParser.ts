@@ -153,6 +153,17 @@ export class EventParser {
       case "partial-message-data": {
         this.ingestMessageList(frame.messages);
         this.ingestUsage(frame.messages);
+        if (!this.skipInitialHistory) {
+          const status = info?.status;
+          const conversationId = info?.id as string | undefined;
+          if (status === "Completed" && this.lastTurnStatus !== "completed") {
+            this.endTurn("completed", conversationId);
+          } else if (status === "Failed" && this.lastTurnStatus !== "failed") {
+            this.endTurn("failed", conversationId);
+          } else if (status === "Cancelled" && this.lastTurnStatus !== "cancelled") {
+            this.endTurn("cancelled", conversationId);
+          }
+        }
         return;
       }
       case "partial-message-elements": {
@@ -311,6 +322,7 @@ export class EventParser {
       if (CJK_CHAR.test(char)) this.cjkChars += 1;
       else this.otherChars += 1;
     }
+    this.emittedTurnContent = true;
     if (element.type === "REASON") this.emit({ type: "thought", messageId, text: delta });
     else this.emit({ type: "text", messageId, text: delta });
   }
@@ -329,6 +341,7 @@ export class EventParser {
     if (!state) {
       state = { status: "pending", output: status === "pending" ? output : undefined };
       this.tools.set(toolCallId, state);
+      this.emittedTurnContent = true;
       this.emit({
         type: "tool_start",
         messageId,
@@ -343,6 +356,7 @@ export class EventParser {
     if (state.status === status && state.output === output) return;
     state.status = status;
     state.output = output;
+    this.emittedTurnContent = true;
     this.emit({
       type: "tool_update",
       messageId,
@@ -375,8 +389,14 @@ export class EventParser {
     return this.lastTurnStatus;
   }
 
+  /** True once any non-history thought/text/tool output was emitted this turn. */
+  get hasTurnOutput(): boolean {
+    return this.emittedTurnContent;
+  }
+
   private turnEnded = false;
   private lastTurnStatus: "completed" | "failed" | "cancelled" | undefined;
+  private emittedTurnContent = false;
 
   private endTurn(status: "completed" | "failed" | "cancelled", conversationId?: string): void {
     this.turnEnded = true;
@@ -439,4 +459,51 @@ function toNumber(value: unknown): number {
 
 function toPositive(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+}
+
+/** Formats an `ask_user_question` payload as plain Markdown for ACP clients. */
+export function formatAskUserQuestion(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "";
+  const record = payload as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  let rawQuestions = record.questions;
+  if (typeof rawQuestions === "string") {
+    try {
+      rawQuestions = JSON.parse(rawQuestions);
+    } catch {
+      return "";
+    }
+  }
+  if (!Array.isArray(rawQuestions)) return "";
+
+  const blocks: string[] = [];
+  for (const entry of rawQuestions) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const promptText =
+      typeof item.prompt === "string" && item.prompt.trim()
+        ? item.prompt.trim()
+        : typeof item.question === "string" && item.question.trim()
+          ? item.question.trim()
+          : "";
+    const optionLines = Array.isArray(item.options)
+      ? item.options
+          .map((opt) =>
+            opt && typeof opt === "object" && typeof (opt as Record<string, unknown>).label === "string"
+              ? ((opt as Record<string, unknown>).label as string).trim()
+              : "",
+          )
+          .filter((label) => label.length > 0)
+          .map((label) => `- ${label}`)
+      : [];
+    if (!promptText && optionLines.length === 0) continue;
+    const parts: string[] = [];
+    if (promptText) parts.push(promptText);
+    if (optionLines.length > 0) parts.push(optionLines.join("\n"));
+    blocks.push(parts.join("\n"));
+  }
+
+  if (blocks.length === 0) return "";
+  const header = title ? `**${title}**\n\n` : "";
+  return `\n\n${header}${blocks.join("\n\n")}`;
 }

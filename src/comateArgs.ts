@@ -98,6 +98,10 @@ export function buildResumeArgs(options: {
   // comatecli requires a query on resume; fall back to a neutral continuation.
   args.push("-q", options.prompt ?? "继续");
   if (options.eventStream !== false) args.push("-d", "event-stream");
+  // Keep requires_action suspension observable across approval restarts without
+  // re-enabling --disable-auto-approve (which would re-prompt on every command).
+  args.push("--on-requires-action", "suspend");
+  args.push("--requires-action-exit-code", String(SUSPEND_EXIT_CODE));
 
   return args;
 }

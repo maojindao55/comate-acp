@@ -55,9 +55,9 @@ export class StderrTail {
  * failure rather than an execution or runtime exception.
  */
 export function isGracefulExitCleanupError(detail: string): boolean {
-  return (
-    GRACEFUL_EXIT_HEADER.test(detail) &&
-    CLEANUP_ERROR_MARKER.test(detail) &&
-    !UNCAUGHT_FATAL_MARKER.test(detail)
-  );
+  const match = detail.match(GRACEFUL_EXIT_HEADER);
+  if (!match || match.index === undefined) return false;
+  if (!CLEANUP_ERROR_MARKER.test(detail) || UNCAUGHT_FATAL_MARKER.test(detail)) return false;
+  const beforeHeader = detail.slice(0, match.index);
+  return !/^\s*(?:Error:|Unhandled rejection:|Uncaught exception:)/im.test(beforeHeader);
 }

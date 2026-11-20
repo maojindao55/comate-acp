@@ -80,4 +80,16 @@ test("isGracefulExitCleanupError matches post-turn provider cleanup failures onl
     ),
     false,
   );
+  assert.equal(
+    isGracefulExitCleanupError(
+      "Error: Conversation failed or cancelled\nError during graceful exit:\nAggregateError: agent-core provider cleanup failed (2)",
+    ),
+    false,
+  );
+  assert.equal(
+    isGracefulExitCleanupError(
+      "Warning: pending action for conv-1 is stale (older than 24h); resuming anyway.\n" + WINDOWS_CLEANUP_STDERR,
+    ),
+    true,
+  );
 });

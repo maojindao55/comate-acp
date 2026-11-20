@@ -53,6 +53,9 @@ test("resume args: approve carries the conversation and a fallback query", () =>
   assert.ok(args.includes("c1"));
   // comatecli requires -q even on resume.
   assert.equal(args[args.indexOf("-q") + 1], "继续");
+  assert.equal(args[args.indexOf("--on-requires-action") + 1], "suspend");
+  assert.equal(args[args.indexOf("--requires-action-exit-code") + 1], "75");
+  assert.equal(args.includes("--disable-auto-approve"), false);
 });
 
 test("resume args: reject and tool result payload", () => {

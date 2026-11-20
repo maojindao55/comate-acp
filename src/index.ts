@@ -28,7 +28,14 @@ import {
   type Effort,
   type ModeId,
 } from "./comateArgs.js";
-import { createParserState, EventParser, type ParserEvent, type ParserState, type RequiresActionPayload } from "./eventParser.js";
+import {
+  createParserState,
+  EventParser,
+  formatAskUserQuestion,
+  type ParserEvent,
+  type ParserState,
+  type RequiresActionPayload,
+} from "./eventParser.js";
 import { materializePrompt, type MaterializedPrompt } from "./attachments.js";
 import type { TurnMetrics } from "./eventParser.js";
 import { ModelCatalog } from "./models.js";
@@ -377,16 +384,26 @@ function runTurn(options: TurnOptions): Promise<TurnOutcome> {
         return;
       }
       const detail = stderrTail.text();
-      if (
-        code === 1 &&
-        parser.turnStatus === "completed" &&
-        !suspend &&
-        !isComateAuthError(detail) &&
-        isGracefulExitCleanupError(detail)
-      ) {
-        logDebug("comatecli 回合已完成，忽略退出清理阶段错误:", detail);
-        finish({ conversationId, metrics: turnMetrics, estimatedOutputTokens });
-        return;
+      if (code === 1 && !isComateAuthError(detail) && isGracefulExitCleanupError(detail)) {
+        if (suspend) {
+          logDebug("comatecli 挂起交互后退出清理阶段报错（已忽略）:", detail);
+          finish({
+            conversationId,
+            requiresAction: suspend,
+            metrics: turnMetrics,
+            estimatedOutputTokens,
+          });
+          return;
+        }
+        if (
+          parser.turnStatus !== "failed" &&
+          parser.turnStatus !== "cancelled" &&
+          (parser.turnStatus === "completed" || parser.hasTurnOutput)
+        ) {
+          logDebug("comatecli 回合已完成，忽略退出清理阶段错误:", detail);
+          finish({ conversationId, metrics: turnMetrics, estimatedOutputTokens });
+          return;
+        }
       }
       const message = `comatecli 退出码 ${code}${detail ? `: ${detail}` : ""}`;
       if (isComateAuthError(detail)) {
@@ -632,7 +649,6 @@ const app = agent({ name: "comate-acp" })
       model: session.model,
       effort: session.effort,
       mode: session.mode,
-      enableInteractiveTools: true,
       attachImages: images,
     });
 
@@ -659,6 +675,20 @@ const app = agent({ name: "comate-acp" })
       }
 
       const requiresAction = await enrichPending(session, outcome.requiresAction);
+      if (requiresAction.toolName === "ask_user_question") {
+        const formatted = formatAskUserQuestion(requiresAction.payload);
+        if (formatted) {
+          emit(ctx.client, session.sessionId, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: formatted },
+          });
+        }
+        logDebug("收到 ask_user_question，按正常回复结束当前回合:", { conversationId: session.conversationId });
+        return {
+          stopReason: "end_turn",
+          ...metricsMeta(outcome.metrics, outcome.estimatedOutputTokens),
+        };
+      }
       const decision = await requestDecision(ctx.client, session.sessionId, requiresAction);
       if (decision === "cancelled") {
         return {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { EventParser, createParserState } from "../dist/eventParser.js";
+import { EventParser, createParserState, formatAskUserQuestion } from "../dist/eventParser.js";
 
 function readLines(name) {
   const raw = readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf-8");
@@ -255,4 +255,101 @@ test("turnStatus tracks completed/failed/cancelled and resets on Running", () =>
   parser.ingest({ type: "conversation-status", conversationInfo: { id: "c1", status: "Cancelled" } });
   assert.equal(parser.turnStatus, "cancelled");
   assert.equal(parser.finished, true);
+});
+
+test("hasTurnOutput ignores skipped history and tracks emitted turn content", () => {
+  const events = [];
+  const parser = new EventParser((event) => events.push(event), createParserState(), {
+    skipInitialHistory: true,
+  });
+  assert.equal(parser.hasTurnOutput, false);
+
+  parser.ingest({
+    type: "conversation-messages",
+    conversationInfo: { id: "c1", status: "Running" },
+    snapshotVersion: { mutation: "refresh" },
+    messages: [
+      {
+        id: "old-a",
+        role: "assistant",
+        elements: [{ id: "g1", children: [{ id: "e1", type: "TEXT", end: true, content: "old answer" }] }],
+      },
+    ],
+  });
+  assert.equal(parser.hasTurnOutput, false);
+
+  parser.ingest({
+    type: "conversation-messages",
+    conversationInfo: { id: "c1", status: "Running" },
+    snapshotVersion: { mutation: "submit" },
+    messages: [
+      {
+        id: "old-a",
+        role: "assistant",
+        elements: [{ id: "g1", children: [{ id: "e1", type: "TEXT", end: true, content: "old answer" }] }],
+      },
+      { id: "new-u", role: "user", content: "hi" },
+      {
+        id: "new-a",
+        role: "assistant",
+        elements: [{ id: "g2", children: [{ id: "e2", type: "TEXT", end: false, content: "new answer" }] }],
+      },
+    ],
+  });
+  assert.equal(parser.hasTurnOutput, true);
+
+  const toolParser = new EventParser(() => {});
+  assert.equal(toolParser.hasTurnOutput, false);
+  toolParser.ingest({
+    type: "partial-message-elements",
+    messageData: {
+      id: "m1",
+      elements: [
+        { id: "g3", children: [{ id: "t1", type: "TOOL", toolName: "read_file", toolState: "pending", params: {} }] },
+      ],
+    },
+  });
+  assert.equal(toolParser.hasTurnOutput, true);
+});
+
+test("partial-message-data Completed updates turnStatus", () => {
+  const events = [];
+  const parser = new EventParser((event) => events.push(event));
+  parser.ingest({
+    type: "partial-message-data",
+    conversationInfo: { id: "c1", status: "Completed" },
+    messages: [],
+  });
+  assert.equal(parser.turnStatus, "completed");
+  assert.equal(parser.finished, true);
+  assert.deepEqual(events, [{ type: "turn_end", status: "completed", conversationId: "c1" }]);
+});
+
+test("formatAskUserQuestion renders title, prompt, and non-empty option labels", () => {
+  const fromArray = formatAskUserQuestion({
+    title: "选择修复范围",
+    questions: [
+      {
+        id: "fix_scope",
+        prompt: "你希望怎么处理？",
+        options: [
+          { id: "all", label: "修复全部问题" },
+          { id: "p0p1", label: "仅修复 P0/P1" },
+          { id: "other_option", label: "" },
+          { id: "blank", label: "   " },
+        ],
+      },
+    ],
+  });
+  assert.equal(
+    fromArray,
+    "\n\n**选择修复范围**\n\n你希望怎么处理？\n- 修复全部问题\n- 仅修复 P0/P1",
+  );
+
+  const fromJsonString = formatAskUserQuestion({
+    questions: JSON.stringify([{ question: "是否继续？", options: [{ label: "是" }, { label: "否" }] }]),
+  });
+  assert.equal(fromJsonString, "\n\n是否继续？\n- 是\n- 否");
+  assert.equal(formatAskUserQuestion({}), "");
+  assert.equal(formatAskUserQuestion(null), "");
 });

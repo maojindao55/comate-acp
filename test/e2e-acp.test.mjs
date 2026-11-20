@@ -659,14 +659,158 @@ test("graceful-exit cleanup error without Completed status still fails", { timeo
   );
 });
 
-test("E2E runs default ZULU_EDIT_PATCH_MODE to 0 and respect explicit override", { timeout: 10000 }, async (t) => {
+test("E2E runs default ZULU_EDIT_PATCH_MODE to 0, omit --enable-interactive-tools, and respect explicit override", { timeout: 10000 }, async (t) => {
   const defaultAgent = await mcpAgent(t);
   const { sessionId: sid1 } = await defaultAgent.request("session/new", { cwd: defaultAgent.cwd, mcpServers: [] });
   await defaultAgent.prompt(sid1);
   assert.equal(defaultAgent.runs()[0].editPatchMode, "0");
+  assert.equal(defaultAgent.runs()[0].args.includes("--enable-interactive-tools"), false);
 
   const overrideAgent = await mcpAgent(t, { ZULU_EDIT_PATCH_MODE: "1" });
   const { sessionId: sid2 } = await overrideAgent.request("session/new", { cwd: overrideAgent.cwd, mcpServers: [] });
   await overrideAgent.prompt(sid2);
   assert.equal(overrideAgent.runs()[0].editPatchMode, "1");
+});
+
+test("ask_user_question with post-turn cleanup error resolves cleanly as end_turn without prompting permission", { timeout: 10000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "comate-acp-ask-user-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const fixture = join(dir, "ask-user.jsonl");
+  writeFileSync(
+    fixture,
+    [
+      JSON.stringify({ type: "conversation-status", conversationInfo: { id: "ask-conv", status: "Running" } }),
+      JSON.stringify({
+        type: "partial-message-elements",
+        conversationInfo: { id: "ask-conv", status: "Running" },
+        messageData: {
+          id: "msg-1",
+          elements: [
+            {
+              id: "g1",
+              children: [
+                { id: "t1", type: "TEXT", end: true, content: "## Code Review 报告" },
+                {
+                  id: "q1",
+                  type: "TOOL",
+                  toolName: "ask_user_question",
+                  toolState: "executed",
+                  params: { title: "选择修复范围" },
+                  result: { metadata: { state: "pending" } },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "requires_action",
+        conversationId: "ask-conv",
+        toolId: "q1",
+        toolName: "ask_user_question",
+        actionType: "ask_user_question",
+        resumeToken: "ask-conv:q1",
+        payload: {
+          title: "选择修复范围",
+          questions: [
+            {
+              id: "fix_scope",
+              prompt: "你希望怎么处理？",
+              options: [
+                { id: "all", label: "修复全部问题" },
+                { id: "record_only", label: "仅记录问题" },
+                { id: "other_option", label: "" },
+              ],
+            },
+          ],
+        },
+      }),
+    ].join("\n") + "\n",
+  );
+
+  const agent = await mcpAgent(t, {
+    FAKE_FIXTURE: fixture,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: GRACEFUL_EXIT_CLEANUP_STDERR,
+  });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [] });
+  const result = await agent.prompt(sessionId);
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(agent.getStderr(), "");
+  assert.equal(agent.notifications.some((n) => n.method === "session/request_permission"), false);
+
+  const text = agent.notifications
+    .filter((n) => n.method === "session/update" && n.params.update.sessionUpdate === "agent_message_chunk")
+    .map((n) => n.params.update.content.text)
+    .join("");
+  assert.match(text, /## Code Review 报告/);
+  assert.match(text, /\*\*选择修复范围\*\*/);
+  assert.match(text, /你希望怎么处理？/);
+  assert.match(text, /- 修复全部问题/);
+  assert.match(text, /- 仅记录问题/);
+});
+
+test("post-output graceful-exit cleanup error succeeds even when Completed frame was omitted, while empty Running fails", { timeout: 10000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "comate-acp-output-only-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const outputOnlyFixture = join(dir, "output-only.jsonl");
+  writeFileSync(
+    outputOnlyFixture,
+    [
+      JSON.stringify({ type: "conversation-status", conversationInfo: { id: "out-conv", status: "Running" } }),
+      JSON.stringify({
+        type: "partial-message-elements",
+        conversationInfo: { id: "out-conv", status: "Running" },
+        messageData: {
+          id: "msg-out",
+          elements: [{ id: "g1", children: [{ id: "t1", type: "TEXT", end: true, content: "Done." }] }],
+        },
+      }),
+    ].join("\n") + "\n",
+  );
+
+  const okAgent = await mcpAgent(t, {
+    FAKE_FIXTURE: outputOnlyFixture,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: GRACEFUL_EXIT_CLEANUP_STDERR,
+  });
+  const { sessionId: okSid } = await okAgent.request("session/new", { cwd: okAgent.cwd, mcpServers: [] });
+  const okResult = await okAgent.prompt(okSid);
+  assert.equal(okResult.stopReason, "end_turn");
+  assert.equal(okAgent.getStderr(), "");
+
+  const emptyRunningFixture = join(dir, "empty-running.jsonl");
+  writeFileSync(
+    emptyRunningFixture,
+    JSON.stringify({ type: "conversation-status", conversationInfo: { id: "empty-conv", status: "Running" } }) + "\n",
+  );
+  const emptyAgent = await mcpAgent(t, {
+    FAKE_FIXTURE: emptyRunningFixture,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: GRACEFUL_EXIT_CLEANUP_STDERR,
+  });
+  const { sessionId: emptySid } = await emptyAgent.request("session/new", { cwd: emptyAgent.cwd, mcpServers: [] });
+  await assert.rejects(
+    emptyAgent.prompt(emptySid),
+    (error) => JSON.parse(error.message).code === -32603,
+  );
+});
+
+test("preceding Error line before graceful-exit header still fails even after Completed output", { timeout: 10000 }, async (t) => {
+  const agent = await mcpAgent(t, {
+    FAKE_FIXTURE: TEXT_FIXTURE,
+    FAKE_EXIT_CODE: "1",
+    FAKE_STDERR: `Error: upstream failure\n${GRACEFUL_EXIT_CLEANUP_STDERR}`,
+  });
+  const { sessionId } = await agent.request("session/new", { cwd: agent.cwd, mcpServers: [] });
+  await assert.rejects(
+    agent.prompt(sessionId),
+    (error) => {
+      const parsed = JSON.parse(error.message);
+      assert.equal(parsed.code, -32603);
+      assert.match(parsed.message, /upstream failure/);
+      return true;
+    },
+  );
 });
